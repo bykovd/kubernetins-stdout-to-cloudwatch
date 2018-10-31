@@ -1,0 +1,135 @@
+#!/bin/bash
+#For the lab we will use Ubuntu 16.04 LTS running on AWS EC2 instance
+
+#Installing prerequisits
+apt-get update -y 
+apt-get install -y docker.io nodejs-legacy socat 
+#Instaling minicube cluster
+curl -Lo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 && chmod +x minikube && sudo mv minikube /usr/local/bin/
+#Installing kubectl
+curl -Lo kubectl https://storage.googleapis.com/kubernetes-release/release/v1.10.0/bin/linux/amd64/kubectl && chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+# Starting minikube. On AWS EC2 instance shose --vm-driver=none
+minikube start --vm-driver=none
+
+#Installing Kubernetis package manager helm
+curl -Lo /tmp/helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get && chmod +x  /tmp/helm.sh && /tmp/helm.sh 
+
+#Adding helm repository  to install chart helm
+helm repo add incubator https://kubernetes-charts-incubator.storage.googleapis.com/
+helm repo update
+helm init
+#Deploying helm pod to manage container logs. There are two ways
+#To work with AWS via AMI instance role
+helm install --name=role-access incubator/fluentd-cloudwatch --set awsRegion=eu-west-1,rbac.create=true --set logGroupName=kubernetis
+#To work via Access key / Secret key
+helm install --name=fluentd ./ --set awsAccessKeyId=AKIAJKALCR3LOFA7RBDA awsSecretAccessKey=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
+
+# Preparigin simple js application which will listen http on 8080 port and logs accessl log into stdout
+mkdir -p  /tmp/docker/stdout-container
+
+cat <<EOF > /tmp/docker/stdout-container/server.js
+var http = require('http');
+
+var handleRequest = function(request, response) {
+  console.log('Received request for URL: ' + request.url);
+  response.writeHead(200);
+  response.end('Simple application. All request printed in stdout!');
+};
+var www = http.createServer(handleRequest);
+www.listen(8080);
+EOF
+
+# Preparing Docer build of image with js application inside
+cat <<EOF > /tmp/docker/stdout-container/Dockerfile
+FROM node:6.14.2
+EXPOSE 8080
+COPY server.js .
+CMD node server.js
+EOF
+
+# Building docker image
+cd /tmp/docker/stdout-container/
+docker build -t stdout-container:v1 .
+
+# Starting deployment based on our docker image
+kubectl run stdout-container --image=hello-node:v1 --port=8080 --image-pull-policy=Never
+
+#Preparing yaml config file for service wich will  listen port 3033 and forward it inside pod to our application
+cat <<EOF > /tmp/docker/stdout-container/Service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: stdout-container
+  labels:
+    run: stdout-container
+spec:
+  type: NodePort
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30333
+    protocol: TCP
+    name: http
+  selector:
+    run: stdout-container
+EOF
+
+kubectl create -f /tmp/docker/stdout-container/Service.yaml
+
+#Checking running pods
+kubectl get pods
+#NAME                                   READY     STATUS    RESTARTS   AGE
+#role-access-fluentd-cloudwatch-zz4rg   1/1       Running   0          8m
+s#tdout-container-67c4dcff4c-zjqgf      1/1       Running   0          1m
+
+#Checking running service 
+kubectl get service
+#NAME               TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)          AGE
+#kubernetes         ClusterIP   10.96.0.1       <none>        443/TCP          10m
+#stdout-container   NodePort    10.103.61.203   <none>        8080:30333/TCP   6m
+
+#Cheking our application external  url 
+minikube service stdout-container --url
+#http://192.168.2.128:30333
+
+#Trying to open url 
+curl http://192.168.2.128:30333/test-from-curl
+
+#Cheking pod stdout logs
+kubectl log stdout-container-67c4dcff4c-zjqgf
+#log is DEPRECATED and will be removed in a future version. Use logs instead.
+#Received request for URL: /test-from-curl
+
+#####################
+#Problems start here#
+#####################
+
+
+#Checking fluentd pod logs 
+kubectl logs role-access-fluentd-cloudwatch-zz4rg
+#...
+#  2018-10-31 13:24:41 +0000 [error]: unexpected error error_class=Errno::EACCES error=#<Errno::EACCES: Permission denied @ rb_sysopen - /var/log/fluentd-containers.log.pos>
+#  2018-10-31 13:24:41 +0000 [error]: /fluentd/vendor/bundle/ruby/2.4.0/gems/fluentd-0.12.43/lib/fluent/plugin/in_tail.rb:145:in `initialize'
+#...
+
+# Problem because of permissions. Local directory mounted into container and has incufficient permissions
+ls -la /var/
+#drwxrwxr-x 10 root syslog 4096 Oct 31 13:10 log
+
+#To fix the probem  allow other write to the directory
+chmod o+w /var/log/
+
+#Now the problem is fixed  and fluentd can see the logs of all  containers
+#......
+#2018-10-31 13:33:21 +0000 [warn]: /var/log/containers/stdout-container-67c4dcff4c-zjqgf_default_stdout-container-076ae6835dfa3018b0a2a7ab5128c931b136b23c8d73f615628eb77353c6430c.log unreadable. It is excluded and would be examined next time.
+#......
+
+#But it still can't process it. I googled for this issus and some people say that it might be related to symlinks
+ls -la /var/log/containers/stdout-container-67c4dcff4c-zjqgf_default_stdout-container-076ae6835dfa3018b0a2a7ab5128c931b136b23c8d73f615628eb77353c6430c.log 
+#lrwxrwxrwx 1 root root 73 Oct 31 13:20 /var/log/containers/stdout-container-67c4dcff4c-zjqgf_default_stdout-container-076ae6835dfa3018b0a2a7ab5128c931b136b23c8d73f615628eb77353c6430c.log -> /var/log/pods/c39cb80f-dd0f-11e8-9bef-0a6ed14c2cc0/stdout-container/0.log
+#So we need to mount anothe path  into container  /var/log/pods/
+#But since we run fluentd via helm we cant modify it.
+#One of possible ways it to run fluentd pod manually
+
+
